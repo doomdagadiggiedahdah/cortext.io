@@ -6,6 +6,7 @@ scikit-learn
 boto3
 matplotlib
 flask
+fastmcp
 
 # needed to manually install elasticsearch6 and matplotlib
 # we can use uv to speed up install
