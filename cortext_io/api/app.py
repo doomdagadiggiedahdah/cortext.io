@@ -2,14 +2,21 @@ import os
 import logging
 import datetime
 import subprocess
-from flask import Flask, request, jsonify, send_file
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from fastapi_mcp import FastApiMCP
 
-app = Flask(__name__)
+app = FastAPI(title="Cortext IO API", description="API for Cortext IO text processing")
 
+# File paths
 input_file = "/home/ec2-user/cortext_io/cortext_io_input/input.txt"
 java_script_path = "/home/ec2-user/cortext_io/AA_cortext_io_linux_0.1/AA_cortext_io_linux/AA_cortext_io_linux_run.sh"
 scripts_dir = "/home/ec2-user/cortext_io/10K_RiskFactors_PROCESS/"
+html_file_path = '/home/ec2-user/cortext_io/cortext_io_db/000_cortext_io.html'
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -20,50 +27,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger('cortext_api')
 
-@app.route('/write', methods=['POST'])
-def write_to_file():
-    data = request.json
+# Define Pydantic models for request and response data
+class TextInput(BaseModel):
+    text: str
 
-    if not data or 'text' not in data:
-        return jsonify({'status': 'error', 'message': 'No text provided'}), 400
+class StatusResponse(BaseModel):
+    status: str
+    message: str
 
-    text = data['text']
+class ScriptResult(BaseModel):
+    script: str
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_seconds: float
 
+class PythonScriptsResponse(BaseModel):
+    status: str
+    message: str
+    run_id: str
+    results: List[ScriptResult]
+
+class JavaResponse(BaseModel):
+    status: str
+    message: str
+    output: Optional[str] = None
+    error: Optional[str] = None
+
+class ErrorResponse(BaseModel):
+    status: str
+    message: str
+    run_id: Optional[str] = None
+
+@app.post("/write", response_model=StatusResponse)
+async def write_to_file(data: TextInput):
+    """
+    Write the provided text to the input file.
+    """
     try:
         with open(input_file, 'w') as file:
-            file.write(text)
-        return jsonify({'status': 'success', 'message': 'Text written to file'}), 200
+            file.write(data.text)
+        return StatusResponse(status="success", message="Text written to file")
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/download-html', methods=['GET'])
-def download_html():
-    html_file_path = '/home/ec2-user/cortext_io/cortext_io_db/000_cortext_io.html'
-
+@app.get("/download-html")
+async def download_html():
+    """
+    Download the generated HTML file.
+    """
     try:
         # Check if the file exists
         if not os.path.exists(html_file_path):
-            return jsonify({
-                'status': 'error',
-                'message': 'HTML file not found'
-            }), 404
+            raise HTTPException(
+                status_code=404, 
+                detail="HTML file not found"
+            )
 
         # Return the file as an attachment
-        return send_file(
-            html_file_path,
-            mimetype='text/html',
-            as_attachment=True,
-            download_name='000_cortext_io.html'
+        return FileResponse(
+            path=html_file_path,
+            media_type='text/html',
+            filename='000_cortext_io.html'
         )
 
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/run-java', methods=['POST'])
-def run_java():
+@app.post("/run-java", response_model=JavaResponse)
+async def run_java():
+    """
+    Run the Java script and return the results.
+    """
     try:
         # Change to the required directory
         os.chdir(scripts_dir)
@@ -80,26 +117,30 @@ def run_java():
         
         # Check if the process completed successfully
         if process.returncode == 0:
-            return jsonify({
-                'status': 'success',
-                'message': 'Java process executed successfully',
-                'output': stdout.decode('utf-8')
-            }), 200
+            return JavaResponse(
+                status="success",
+                message="Java process executed successfully",
+                output=stdout.decode('utf-8')
+            )
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Java process failed',
-                'error': stderr.decode('utf-8')
-            }), 500
+            return JavaResponse(
+                status="error",
+                message="Java process failed",
+                error=stderr.decode('utf-8')
+            )
             
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/run-python-scripts', methods=['POST'])
-def run_python_scripts():
+@app.post("/run-python-scripts", response_model=PythonScriptsResponse)
+async def run_python_scripts():
+    """
+    Run all Python scripts in sequence and return the results.
+    """
+    # Generate a unique run ID for tracking this execution
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     try:
-        # Generate a unique run ID for tracking this execution
-        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         logger.info(f"[{run_id}] Starting Python scripts execution")
         
         # Change to the scripts directory
@@ -147,56 +188,86 @@ def run_python_scripts():
                 if stdout_str:
                     logger.info(f"[{run_id}] Output: {stdout_str[:200]}{'...' if len(stdout_str) > 200 else ''}")
             
-            results.append({
-                'script': script,
-                'returncode': process.returncode,
-                'stdout': stdout_str,
-                'stderr': stderr_str,
-                'duration_seconds': duration
-            })
+            results.append(ScriptResult(
+                script=script,
+                returncode=process.returncode,
+                stdout=stdout_str,
+                stderr=stderr_str,
+                duration_seconds=duration
+            ))
             
             # If any script fails, stop the sequence
             if process.returncode != 0:
                 logger.error(f"[{run_id}] Stopping script sequence due to failure")
-                return jsonify({
-                    'status': 'error',
-                    'message': f'Script {script} failed',
-                    'run_id': run_id,
-                    'results': results
-                }), 500
+                return PythonScriptsResponse(
+                    status="error",
+                    message=f'Script {script} failed',
+                    run_id=run_id,
+                    results=results
+                )
         
         logger.info(f"[{run_id}] All Python scripts executed successfully")
-        return jsonify({
-            'status': 'success',
-            'message': 'All Python scripts executed successfully',
-            'run_id': run_id,
-            'results': results
-        }), 200
+        return PythonScriptsResponse(
+            status="success",
+            message="All Python scripts executed successfully",
+            run_id=run_id,
+            results=results
+        )
         
     except Exception as e:
-        logger.exception(f"[{run_id if 'run_id' in locals() else 'UNKNOWN'}] Exception occurred: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'run_id': run_id if 'run_id' in locals() else 'UNKNOWN'
-        }), 500
+        logger.exception(f"[{run_id}] Exception occurred: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "status": "error",
+                "message": str(e),
+                "run_id": run_id
+            }
+        )
 
-@app.route('/run-full-process', methods=['POST'])
-def run_full_process():
-    """Run the complete process: Java script followed by all Python scripts"""
+@app.post("/run-full-process", response_model=PythonScriptsResponse)
+async def run_full_process():
+    """
+    Run the complete process: Java script followed by all Python scripts.
+    """
     try:
         # First run the Java process
-        java_result = run_java()
+        java_result = await run_java()
         
         # If Java process failed, return the error
-        if java_result[1] != 200:
-            return java_result
+        if java_result.status == "error":
+            run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            return PythonScriptsResponse(
+                status="error",
+                message=f"Java process failed: {java_result.error}",
+                run_id=run_id,
+                results=[]
+            )
         
         # Then run the Python scripts
-        return run_python_scripts()
+        return await run_python_scripts()
         
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        logger.exception(f"[{run_id}] Exception in full process: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "status": "error",
+                "message": str(e),
+                "run_id": run_id
+            }
+        )
+
+# Add MCP integration
+mcp = FastApiMCP(
+    app, 
+    name="Cortext IO API",
+    description="API for Cortext IO text processing"
+)
+# Mount the MCP server to your FastAPI app
+mcp.mount()
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    import uvicorn
+    uvicorn.run(app, host='0.0.0.0', port=5000)
